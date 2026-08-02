@@ -48,7 +48,7 @@ jobs:
       - name: Configure Kiosk Script (Dynamic Inputs)
         if: "${{ github.event_name == 'workflow_dispatch' }}"
         run: |
-          python -c "import re, sys; ip='${{ github.event.inputs.ip_address }}'; port='${{ github.event.inputs.port }}'; key='${{ github.event.inputs.unlock_key }}'; count='${{ github.event.inputs.unlock_count }}'; f=open('kiosk_locker-3.py', 'r', encoding='utf-8'); c=f.read(); f.close(); c=re.sub(r'(TARGET_URL:\s*str\s*=\s*)\"[^\"]*\"', f'TARGET_URL: str = \"http://{ip}:{port}\"', c); c=re.sub(r'(UNLOCK_HOTKEY:\s*str\s*=\s*)\"[^\"]*\"', f'UNLOCK_HOTKEY: str = \"{key}\"', c); c=re.sub(r'(UNLOCK_PRESS_COUNT:\s*int\s*=\s*)\d+', f'UNLOCK_PRESS_COUNT: int = {count}', c); f=open('kiosk_locker-3.py', 'w', encoding='utf-8'); f.write(c); f.close(); print(f'Configured kiosk_locker-3.py with URL http://{ip}:{port}, key {key} ({count} presses)')"
+          python configure_kiosk.py "${{ github.event.inputs.ip_address }}" "${{ github.event.inputs.port }}" "${{ github.event.inputs.unlock_key }}" "${{ github.event.inputs.unlock_count }}"
 
       - name: Build Executable with PyInstaller
         run: |
