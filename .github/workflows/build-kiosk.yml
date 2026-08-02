@@ -1,0 +1,75 @@
+name: Build Kiosk Locker EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      ip_address:
+        description: 'Target Server IP Address'
+        required: true
+        default: '192.168.0.141'
+      port:
+        description: 'Target Server Port'
+        required: true
+        default: '5000'
+      unlock_key:
+        description: 'Unlock Hotkey'
+        required: true
+        default: 'u'
+      unlock_count:
+        description: 'Unlock Press Count'
+        required: true
+        default: '5'
+      build_id:
+        description: 'Build Identifier'
+        required: false
+        default: 'manual'
+
+jobs:
+  build:
+    name: Build Windows Kiosk EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Build Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller keyboard pywin32 pygetwindow psutil pillow
+
+      - name: Configure Kiosk Script (Dynamic Inputs)
+        if: "${{ github.event_name == 'workflow_dispatch' }}"
+        shell: powershell
+        run: |
+          $ip = "${{ github.event.inputs.ip_address }}"
+          $port = "${{ github.event.inputs.port }}"
+          $key = "${{ github.event.inputs.unlock_key }}"
+          $count = "${{ github.event.inputs.unlock_count }}"
+          
+          $content = Get-Content -Path "kiosk_locker-3.py" -Raw
+          $content = $content -replace '(TARGET_URL:\s*str\s*=\s*)"[^"]*"', "TARGET_URL: str = `"http://$ip`:$port`""
+          $content = $content -replace '(UNLOCK_HOTKEY:\s*str\s*=\s*)"[^"]*"', "UNLOCK_HOTKEY: str = `"$key`""
+          $content = $content -replace '(UNLOCK_PRESS_COUNT:\s*int\s*=\s*)\d+', "UNLOCK_PRESS_COUNT: int = $count"
+          
+          Set-Content -Path "kiosk_locker-3.py" -Value $content
+          Write-Host "Configured kiosk_locker-3.py with URL http://$ip`:$port, key $key ($count presses)"
+
+      - name: Build Executable with PyInstaller
+        run: |
+          pyinstaller --onefile --noconsole --uac-admin --name KioskLocker --clean kiosk_locker-3.py
+
+      - name: Upload Kiosk EXE Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KioskLocker-exe-${{ github.event.inputs.build_id || github.sha }}
+          path: dist/KioskLocker.exe
+          retention-days: 7
