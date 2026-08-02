@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+
+{% block title %}Admin Panel - UNITE CBT{% endblock %}
+
+{% block content %}
+<div class="row">
+    <div class="col-md-12">
+        <div class="d-flex justify-content-between align-items-center mb-4">
+            <h2><i class="fas fa-crown me-2 text-warning"></i>Admin Panel</h2>
+            <span class="badge bg-warning text-dark fs-6">
+                <i class="fas fa-users me-1"></i> {{ users|length }} Users
+            </span>
+        </div>
+    </div>
+</div>
+
+<div class="card shadow-lg">
+    <div class="card-header bg-dark text-white">
+        <h5 class="mb-0"><i class="fas fa-user-cog me-2"></i>Manage Users</h5>
+    </div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-hover">
+                <thead>
+                    <tr>
+                        <th>#</th>
+                        <th>Username</th>
+                        <th>Full Name</th>
+                        <th>Email</th>
+                        <th>Status</th>
+                        <th>Joined</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for user in users %}
+                        <tr>
+                            <td>{{ user.id }}</td>
+                            <td><strong>{{ user.username }}</strong></td>
+                            <td>{{ user.full_name }}</td>
+                            <td>{{ user.email }}</td>
+                            <td>
+                                {% if user.is_admin %}
+                                    <span class="badge bg-warning text-dark">Admin</span>
+                                {% elif user.is_approved %}
+                                    <span class="badge bg-success">Approved</span>
+                                {% else %}
+                                    <span class="badge bg-danger">Pending</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ user.created_at.strftime('%Y-%m-%d') }}</td>
+                            <td>
+                                {% if not user.is_admin %}
+                                    {% if not user.is_approved %}
+                                        <form method="POST" action="{{ url_for('approve_user', user_id=user.id) }}" style="display:inline;">
+                                            <button type="submit" class="btn btn-success btn-sm">
+                                                <i class="fas fa-check"></i> Approve
+                                            </button>
+                                        </form>
+                                    {% else %}
+                                        <form method="POST" action="{{ url_for('revoke_user', user_id=user.id) }}" style="display:inline;">
+                                            <button type="submit" class="btn btn-warning btn-sm">
+                                                <i class="fas fa-ban"></i> Revoke
+                                            </button>
+                                        </form>
+                                    {% endif %}
+                                    {% if user.id != current_user.id %}
+                                        <form method="POST" action="{{ url_for('delete_user', user_id=user.id) }}" style="display:inline;" 
+                                              onsubmit="return confirm('Delete this user?')">
+                                            <button type="submit" class="btn btn-danger btn-sm">
+                                                <i class="fas fa-trash"></i> Delete
+                                            </button>
+                                        </form>
+                                    {% endif %}
+                                {% else %}
+                                    <span class="text-muted">System Admin</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<div class="row mt-4">
+    <div class="col-md-6">
+        <div class="card shadow-sm">
+            <div class="card-body">
+                <h6><i class="fas fa-info-circle me-2 text-primary"></i>Statistics</h6>
+                <ul class="list-unstyled">
+                    <li>Total Users: <strong>{{ users|length }}</strong></li>
+                    <li>Approved Users: <strong>{{ users|selectattr('is_approved')|list|length }}</strong></li>
+                    <li>Pending Users: <strong>{{ users|rejectattr('is_approved')|rejectattr('is_admin')|list|length }}</strong></li>
+                    <li>Admins: <strong>{{ users|selectattr('is_admin')|list|length }}</strong></li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card shadow-sm">
+            <div class="card-body">
+                <h6><i class="fas fa-shield-alt me-2 text-success"></i>Quick Actions</h6>
+                <ul class="list-unstyled">
+                    <li><a href="{{ url_for('dashboard') }}" class="btn btn-outline-primary btn-sm w-100 mb-2">
+                        <i class="fas fa-tachometer-alt me-2"></i>Go to Dashboard
+                    </a></li>
+                    <li><a href="{{ url_for('logout') }}" class="btn btn-outline-danger btn-sm w-100">
+                        <i class="fas fa-sign-out-alt me-2"></i>Logout
+                    </a></li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

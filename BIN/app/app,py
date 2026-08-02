@@ -1,0 +1,604 @@
+"""
+================================================================================
+  UNITE CBT - Complete Web Application
+  Version: 1.0.0
+  
+  Features:
+    - User Registration (admin approval required)
+    - User Login/Logout
+    - Admin Panel (manage users)
+    - Dashboard with user info
+    - Kiosk Builder (creates EXE with custom config)
+    - Download Kiosk EXE (valid for 5 minutes)
+================================================================================
+"""
+
+import os
+import re
+import sys
+import json
+import time
+import shutil
+import hashlib
+import subprocess
+import tempfile
+from datetime import datetime, timedelta
+from functools import wraps
+from pathlib import Path
+
+from flask import Flask, render_template, request, redirect, url_for, flash, session, send_file, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
+from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
+
+# Initialize Flask app
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'unite-cbt-secret-key-change-in-production'
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///unite_cbt.db'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['MAX_CONTENT_LENGTH'] = 100 * 1024 * 1024  # 100MB max upload
+
+# Create upload folder if it doesn't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+
+# Initialize extensions
+db = SQLAlchemy(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'login'
+login_manager.login_message = 'Please log in to access this page.'
+login_manager.login_message_category = 'warning'
+
+
+# =============================================================================
+#  DATABASE MODELS
+# =============================================================================
+
+class User(UserMixin, db.Model):
+    """User model with admin flag and approval status."""
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    password_hash = db.Column(db.String(200), nullable=False)
+    full_name = db.Column(db.String(100), nullable=False)
+    is_admin = db.Column(db.Boolean, default=False)
+    is_approved = db.Column(db.Boolean, default=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+    
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+    
+    def __repr__(self):
+        return f'<User {self.username}>'
+
+
+class KioskBuild(db.Model):
+    """Track kiosk builds for download expiration."""
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    filename = db.Column(db.String(200), nullable=False)
+    filepath = db.Column(db.String(500), nullable=False)
+    config = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    downloads = db.Column(db.Integer, default=0)
+    
+    def is_expired(self):
+        return datetime.utcnow() > self.expires_at
+
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+
+# =============================================================================
+#  HELPER FUNCTIONS
+# =============================================================================
+
+def admin_required(f):
+    """Decorator to require admin privileges."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated or not current_user.is_admin:
+            flash('Admin access required.', 'danger')
+            return redirect(url_for('dashboard'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def approved_required(f):
+    """Decorator to require user approval."""
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not current_user.is_authenticated:
+            flash('Please log in.', 'warning')
+            return redirect(url_for('login'))
+        if not current_user.is_approved and not current_user.is_admin:
+            flash('Your account is pending admin approval.', 'warning')
+            return redirect(url_for('logout'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def create_kiosk_exe(ip_address, port, unlock_key, unlock_count, user_id):
+    """
+    Build the kiosk EXE with custom configuration.
+    Returns the path to the built EXE file.
+    """
+    source_file = "kiosk_locker-3.py"
+    
+    # Check if source file exists
+    if not os.path.exists(source_file):
+        raise FileNotFoundError(f"Source file '{source_file}' not found!")
+    
+    # Create a temporary directory for this build
+    build_id = f"{user_id}_{int(time.time())}"
+    temp_dir = os.path.join(tempfile.gettempdir(), f"kiosk_build_{build_id}")
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Copy source file to temp directory
+    temp_source = os.path.join(temp_dir, "kiosk_locker-3.py")
+    shutil.copy2(source_file, temp_source)
+    
+    # Read and update the source file
+    with open(temp_source, 'r', encoding='utf-8') as f:
+        content = f.read()
+    
+    # Update URL
+    new_url = f"http://{ip_address}:{port}"
+    content = re.sub(
+        r'(TARGET_URL:\s*str\s*=\s*)"[^"]*"',
+        f'TARGET_URL: str = "{new_url}"',
+        content
+    )
+    
+    # Update unlock key
+    content = re.sub(
+        r'(UNLOCK_HOTKEY:\s*str\s*=\s*)"[^"]*"',
+        f'UNLOCK_HOTKEY: str = "{unlock_key}"',
+        content
+    )
+    
+    # Update unlock count
+    content = re.sub(
+        r'(UNLOCK_PRESS_COUNT:\s*int\s*=\s*)\d+',
+        f'UNLOCK_PRESS_COUNT: int = {unlock_count}',
+        content
+    )
+    
+    # Write updated content
+    with open(temp_source, 'w', encoding='utf-8') as f:
+        f.write(content)
+    
+    # Build EXE using PyInstaller
+    output_dir = os.path.join(temp_dir, "dist")
+    cmd = [
+        sys.executable,
+        "-m",
+        "PyInstaller",
+        "--onefile",
+        "--noconsole",
+        "--uac-admin",
+        "--name", "KioskLocker",
+        "--distpath", output_dir,
+        "--workpath", os.path.join(temp_dir, "build"),
+        "--specpath", temp_dir,
+        "--clean",
+        "--log-level", "ERROR",
+        temp_source
+    ]
+    
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    if result.returncode != 0:
+        raise RuntimeError(f"Build failed: {result.stderr}")
+    
+    # Find the built EXE
+    exe_path = os.path.join(output_dir, "KioskLocker.exe")
+    if not os.path.exists(exe_path):
+        raise FileNotFoundError("EXE file not found after build")
+    
+    return exe_path, temp_dir
+
+
+def cleanup_old_builds():
+    """Remove expired kiosk builds from database and filesystem."""
+    expired = KioskBuild.query.filter(KioskBuild.expires_at < datetime.utcnow()).all()
+    for build in expired:
+        try:
+            if os.path.exists(build.filepath):
+                # Remove the file
+                os.remove(build.filepath)
+                # Remove the parent temp directory
+                parent_dir = os.path.dirname(build.filepath)
+                if os.path.exists(parent_dir):
+                    shutil.rmtree(parent_dir, ignore_errors=True)
+        except Exception:
+            pass
+        db.session.delete(build)
+    db.session.commit()
+
+
+# =============================================================================
+#  ROUTES
+# =============================================================================
+
+@app.route('/')
+def index():
+    """Home page - redirect to login or dashboard."""
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    return redirect(url_for('login'))
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """User login page."""
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        remember = request.form.get('remember') == 'on'
+        
+        user = User.query.filter_by(username=username).first()
+        
+        if user and user.check_password(password):
+            if not user.is_approved and not user.is_admin:
+                flash('Your account is pending admin approval. Please wait.', 'warning')
+                return render_template('login.html')
+            
+            login_user(user, remember=remember)
+            flash(f'Welcome back, {user.full_name}!', 'success')
+            return redirect(url_for('dashboard'))
+        else:
+            flash('Invalid username or password.', 'danger')
+    
+    return render_template('login.html')
+
+
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    """User registration page."""
+    if current_user.is_authenticated:
+        return redirect(url_for('dashboard'))
+    
+    if request.method == 'POST':
+        username = request.form.get('username').strip()
+        email = request.form.get('email').strip()
+        full_name = request.form.get('full_name').strip()
+        password = request.form.get('password')
+        confirm_password = request.form.get('confirm_password')
+        
+        # Validation
+        errors = []
+        if not username or len(username) < 3:
+            errors.append('Username must be at least 3 characters.')
+        if not email or '@' not in email:
+            errors.append('Please enter a valid email address.')
+        if not full_name:
+            errors.append('Please enter your full name.')
+        if not password or len(password) < 6:
+            errors.append('Password must be at least 6 characters.')
+        if password != confirm_password:
+            errors.append('Passwords do not match.')
+        
+        # Check if username or email already exists
+        if User.query.filter_by(username=username).first():
+            errors.append('Username already taken.')
+        if User.query.filter_by(email=email).first():
+            errors.append('Email already registered.')
+        
+        if errors:
+            for error in errors:
+                flash(error, 'danger')
+            return render_template('register.html')
+        
+        # Create new user
+        user = User(
+            username=username,
+            email=email,
+            full_name=full_name,
+            is_admin=False,
+            is_approved=False
+        )
+        user.set_password(password)
+        
+        db.session.add(user)
+        db.session.commit()
+        
+        flash('Registration successful! Your account is pending admin approval.', 'success')
+        return redirect(url_for('login'))
+    
+    return render_template('register.html')
+
+
+@app.route('/logout')
+@login_required
+def logout():
+    """User logout."""
+    logout_user()
+    flash('You have been logged out.', 'info')
+    return redirect(url_for('login'))
+
+
+@app.route('/dashboard')
+@login_required
+@approved_required
+def dashboard():
+    """User dashboard."""
+    # Clean up old builds
+    cleanup_old_builds()
+    
+    # Get user's builds
+    user_builds = KioskBuild.query.filter_by(user_id=current_user.id).order_by(
+        KioskBuild.created_at.desc()
+    ).limit(10).all()
+    
+    return render_template('dashboard.html', user=current_user, builds=user_builds)
+
+
+@app.route('/admin')
+@login_required
+@admin_required
+def admin_panel():
+    """Admin panel to manage users."""
+    users = User.query.order_by(User.created_at.desc()).all()
+    return render_template('admin.html', users=users)
+
+
+@app.route('/admin/approve/<int:user_id>', methods=['POST'])
+@login_required
+@admin_required
+def approve_user(user_id):
+    """Approve a user account."""
+    user = User.query.get_or_404(user_id)
+    if user.is_admin:
+        flash('Cannot approve admin accounts.', 'warning')
+        return redirect(url_for('admin_panel'))
+    
+    user.is_approved = True
+    db.session.commit()
+    flash(f'User {user.username} has been approved.', 'success')
+    return redirect(url_for('admin_panel'))
+
+
+@app.route('/admin/revoke/<int:user_id>', methods=['POST'])
+@login_required
+@admin_required
+def revoke_user(user_id):
+    """Revoke user approval."""
+    user = User.query.get_or_404(user_id)
+    if user.is_admin:
+        flash('Cannot revoke admin accounts.', 'warning')
+        return redirect(url_for('admin_panel'))
+    
+    user.is_approved = False
+    db.session.commit()
+    flash(f'User {user.username} has been revoked.', 'warning')
+    return redirect(url_for('admin_panel'))
+
+
+@app.route('/admin/delete/<int:user_id>', methods=['POST'])
+@login_required
+@admin_required
+def delete_user(user_id):
+    """Delete a user account."""
+    user = User.query.get_or_404(user_id)
+    if user.is_admin:
+        flash('Cannot delete admin accounts.', 'warning')
+        return redirect(url_for('admin_panel'))
+    
+    if user.id == current_user.id:
+        flash('Cannot delete your own account.', 'warning')
+        return redirect(url_for('admin_panel'))
+    
+    db.session.delete(user)
+    db.session.commit()
+    flash(f'User {user.username} has been deleted.', 'success')
+    return redirect(url_for('admin_panel'))
+
+
+@app.route('/api/build_kiosk', methods=['POST'])
+@login_required
+@approved_required
+def build_kiosk():
+    """API endpoint to build kiosk EXE."""
+    try:
+        data = request.get_json()
+        
+        ip_address = data.get('ip_address', '192.168.0.141')
+        port = data.get('port', '5000')
+        unlock_key = data.get('unlock_key', 'u')
+        unlock_count = int(data.get('unlock_count', 5))
+        
+        # Validate inputs
+        if not ip_address:
+            return jsonify({'success': False, 'error': 'IP address is required'}), 400
+        
+        # Validate port
+        try:
+            port_num = int(port)
+            if not (1 <= port_num <= 65535):
+                return jsonify({'success': False, 'error': 'Port must be between 1 and 65535'}), 400
+        except ValueError:
+            return jsonify({'success': False, 'error': 'Invalid port number'}), 400
+        
+        # Validate unlock key
+        if len(unlock_key) != 1:
+            return jsonify({'success': False, 'error': 'Unlock key must be a single character'}), 400
+        
+        # Validate unlock count
+        if not (1 <= unlock_count <= 20):
+            return jsonify({'success': False, 'error': 'Unlock count must be between 1 and 20'}), 400
+        
+        # Build the EXE
+        exe_path, temp_dir = create_kiosk_exe(
+            ip_address, port, unlock_key, unlock_count, current_user.id
+        )
+        
+        # Save build info to database
+        config = json.dumps({
+            'ip_address': ip_address,
+            'port': port,
+            'unlock_key': unlock_key,
+            'unlock_count': unlock_count
+        })
+        
+        expires_at = datetime.utcnow() + timedelta(minutes=5)
+        filename = f"KioskLocker_{current_user.username}_{int(time.time())}.exe"
+        
+        # Move EXE to uploads folder
+        final_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        shutil.move(exe_path, final_path)
+        
+        # Clean up temp directory
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except:
+            pass
+        
+        build = KioskBuild(
+            user_id=current_user.id,
+            filename=filename,
+            filepath=final_path,
+            config=config,
+            expires_at=expires_at
+        )
+        db.session.add(build)
+        db.session.commit()
+        
+        return jsonify({
+            'success': True,
+            'build_id': build.id,
+            'expires_at': expires_at.isoformat(),
+            'filename': filename,
+            'message': 'Kiosk built successfully! Download it within 5 minutes.'
+        })
+        
+    except FileNotFoundError as e:
+        return jsonify({'success': False, 'error': str(e)}), 404
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+@app.route('/api/build_status/<int:build_id>', methods=['GET'])
+@login_required
+@approved_required
+def build_status(build_id):
+    """Check the status of a kiosk build."""
+    build = KioskBuild.query.filter_by(id=build_id, user_id=current_user.id).first()
+    if not build:
+        return jsonify({'success': False, 'error': 'Build not found'}), 404
+    
+    is_expired = build.is_expired()
+    remaining = 0
+    if not is_expired:
+        remaining = int((build.expires_at - datetime.utcnow()).total_seconds())
+    
+    return jsonify({
+        'success': True,
+        'build_id': build.id,
+        'filename': build.filename,
+        'expired': is_expired,
+        'seconds_remaining': remaining,
+        'downloads': build.downloads
+    })
+
+
+@app.route('/download/<int:build_id>')
+@login_required
+@approved_required
+def download_kiosk(build_id):
+    """Download the kiosk EXE file."""
+    build = KioskBuild.query.filter_by(id=build_id, user_id=current_user.id).first()
+    if not build:
+        flash('Build not found.', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    if build.is_expired():
+        flash('This download link has expired (valid for 5 minutes). Please rebuild the kiosk.', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    if not os.path.exists(build.filepath):
+        flash('File not found. Please rebuild the kiosk.', 'danger')
+        return redirect(url_for('dashboard'))
+    
+    # Increment download count
+    build.downloads += 1
+    db.session.commit()
+    
+    return send_file(
+        build.filepath,
+        as_attachment=True,
+        download_name=build.filename
+    )
+
+
+@app.route('/api/delete_build/<int:build_id>', methods=['POST'])
+@login_required
+@approved_required
+def delete_build(build_id):
+    """Delete a kiosk build."""
+    build = KioskBuild.query.filter_by(id=build_id, user_id=current_user.id).first()
+    if not build:
+        return jsonify({'success': False, 'error': 'Build not found'}), 404
+    
+    try:
+        if os.path.exists(build.filepath):
+            os.remove(build.filepath)
+    except:
+        pass
+    
+    db.session.delete(build)
+    db.session.commit()
+    
+    return jsonify({'success': True})
+
+
+# =============================================================================
+#  CREATE DATABASE TABLES
+# =============================================================================
+
+def init_db():
+    """Initialize the database with tables and admin user."""
+    with app.app_context():
+        db.create_all()
+        
+        # Check if admin exists
+        admin = User.query.filter_by(username='admin').first()
+        if not admin:
+            admin = User(
+                username='admin',
+                email='admin@unitecbt.com',
+                full_name='Administrator',
+                is_admin=True,
+                is_approved=True
+            )
+            admin.set_password('admin123')
+            db.session.add(admin)
+            db.session.commit()
+            print("Admin user created: admin / admin123")
+        else:
+            print("Admin user already exists.")
+
+
+# =============================================================================
+#  RUN APPLICATION
+# =============================================================================
+
+if __name__ == '__main__':
+    init_db()
+    print("\n" + "="*70)
+    print("  UNITE CBT APPLICATION")
+    print("="*70)
+    print("  Admin Login: admin / admin123")
+    print("  URL: http://127.0.0.1:5000")
+    print("="*70 + "\n")
+    app.run(debug=True, host='0.0.0.0', port=5000)
